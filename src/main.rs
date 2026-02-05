@@ -3,9 +3,7 @@ mod checkpoint;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod energy;
-mod fitness;
 mod gpu;
-mod islands;
 mod metrics;
 mod simulation;
 
