@@ -1,0 +1,29 @@
+# Build artifacts
+/target
+
+# Output directories
+/frames*
+/raw_*
+frames_1766911219
+/runs
+/checkpoints
+
+# Generated files
+*.mp4
+*.ppm
+generated.yaml
+metrics.csv
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+spec.md
+optimization_spec.md
+*.log
