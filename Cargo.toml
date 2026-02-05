@@ -19,6 +19,7 @@ wgpu = { version = "0.20", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1.14", features = ["derive"], optional = true }
 png = "0.17"
+jpeg-encoder = "0.6"  # For JPEG output
 flate2 = "1.0"  # For fast zlib compression
 zstd = "0.13"   # For fast raw data compression
 brotli = "7"    # For compression ratio metrics (phase transition detection)

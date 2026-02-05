@@ -8,12 +8,40 @@
 
 #![allow(dead_code)]
 
+// =============================================================================
+// DEPRECATED: Legacy simple CUDA implementation
+// =============================================================================
+// This module contains an OUTDATED BFF implementation that does NOT correctly
+// implement the tape-based energy model:
+//
+// INCORRECT BEHAVIORS:
+// 1. `$` just converts to `@` directly - should require head pointing at `@`
+//    on the OTHER tape half and consume that `@`
+// 2. `@` is treated as a "free step" - should precede an operation to power it
+// 3. No energy zone support (tapes in zones should become pure `@` batteries)
+// 4. No multi-simulation support
+//
+// USE INSTEAD: `CudaMultiSimulation` from `cuda.rs` which correctly implements:
+// - Tape-based energy model (`@` must precede operations)
+// - `$` harvests `@` from other tape half via head position
+// - Energy zones that become `@` batteries
+// - Multi-simulation and mega-mode support
+//
+// TODO: Remove this entire module once confirmed unused
+// =============================================================================
 #[cfg(feature = "cuda")]
+#[deprecated(since = "0.1.0", note = "Use CudaMultiSimulation from cuda.rs instead - this has incorrect energy model")]
 pub mod cuda {
     use cudarc::driver::*;
     use std::sync::Arc;
 
-    /// CUDA kernel source for BFF evaluation
+    /// DEPRECATED: Legacy CUDA kernel with INCORRECT energy model
+    /// 
+    /// This kernel does NOT implement the tape-based energy system correctly:
+    /// - `$` should only convert to `@` if a head points at `@` on other tape half
+    /// - `@` should power the NEXT instruction, not be a "free step"
+    /// 
+    /// Use `BFF_CUDA_KERNEL` in `cuda.rs` instead.
     const BFF_KERNEL: &str = r#"
 extern "C" __global__ void bff_evaluate(
     unsigned char* soup,           // All programs concatenated
@@ -145,7 +173,14 @@ extern "C" __global__ void bff_evaluate(
 }
 "#;
 
-    /// GPU Simulation state
+    /// DEPRECATED: Legacy GPU Simulation with incorrect energy model
+    /// 
+    /// Use `CudaMultiSimulation` from `cuda.rs` instead, which correctly implements:
+    /// - Tape-based energy (`@` must precede operations to power them)
+    /// - `$` harvests `@` from other tape half via head position
+    /// - Energy zones (tapes in zones become `@` batteries)
+    /// - Multi-simulation and mega-mode support
+    #[deprecated(since = "0.1.0", note = "Use CudaMultiSimulation from cuda.rs instead")]
     pub struct GpuSimulation {
         device: Arc<CudaDevice>,
         soup_gpu: CudaSlice<u8>,
@@ -267,6 +302,9 @@ extern "C" __global__ void bff_evaluate(
         }
     }
 }
+// =============================================================================
+// END DEPRECATED SECTION - Everything above in `pub mod cuda` can be removed
+// =============================================================================
 
 /// Check if CUDA is available
 #[cfg(feature = "cuda")]
@@ -530,150 +568,212 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     
-    // BFF evaluation with inlined byte access
+    // === TAPE-BASED ENERGY MODEL BFF EVALUATION ===
+    // @ must precede a BFF op for it to execute. BFF ops without @ are NOPs.
+    // $ harvests @ from the other tape half (via head0 or head1).
+    // ! halts execution immediately.
     var pos: i32 = 2;
-    
-    // Read head positions from tape bytes 0 and 1
     var head0: i32 = i32((tape[0] & 0xFFu) % FULL_TAPE_SIZE);
     var head1: i32 = i32(((tape[0] >> 8u) & 0xFFu) % FULL_TAPE_SIZE);
     var nskip: u32 = 0u;
     
+    // Count @ symbols for early termination check
+    var remaining_energy: u32 = 0u;
+    var has_dollar: bool = false;
+    for (var i = 0u; i < 32u; i++) {
+        let w = tape[i];
+        if ((w & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 8u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 16u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 24u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if ((w & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 8u) & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 16u) & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 24u) & 0xFFu) == 36u) { has_dollar = true; }
+    }
+    
+    let tape_can_run = remaining_energy > 0u || has_dollar;
+    
+    if (tape_can_run) {
     for (var step = 0u; step < params.steps_per_run; step++) {
+        if (remaining_energy == 0u && !has_dollar) { break; }
+        if (pos < 0 || pos >= i32(FULL_TAPE_SIZE)) { break; }
+        
         head0 = head0 & i32(FULL_TAPE_SIZE - 1u);
         head1 = head1 & i32(FULL_TAPE_SIZE - 1u);
         
-        // Read command byte
         let cmd_word_idx = u32(pos) / 4u;
         let cmd_byte_offset = (u32(pos) % 4u) * 8u;
         let cmd = (tape[cmd_word_idx] >> cmd_byte_offset) & 0xFFu;
         
-        switch (cmd) {
-            case 60u: { head0 -= 1; } // '<'
-            case 62u: { head0 += 1; } // '>'
-            case 123u: { head1 -= 1; } // '{'
-            case 125u: { head1 += 1; } // '}'
-            case 43u: { // '+' 
-                let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let word_idx = idx / 4u;
-                let byte_off = (idx % 4u) * 8u;
-                let val = ((tape[word_idx] >> byte_off) & 0xFFu) + 1u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
-            }
-            case 45u: { // '-'
-                let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let word_idx = idx / 4u;
-                let byte_off = (idx % 4u) * 8u;
-                let val = ((tape[word_idx] >> byte_off) & 0xFFu) - 1u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
-            }
-            case 46u: { // '.' - copy from head0 to head1
-                let src_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let dst_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
-                let src_word = src_idx / 4u;
-                let src_off = (src_idx % 4u) * 8u;
-                let val = (tape[src_word] >> src_off) & 0xFFu;
-                let dst_word = dst_idx / 4u;
-                let dst_off = (dst_idx % 4u) * 8u;
-                let mask = ~(0xFFu << dst_off);
-                tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
+        if (cmd == 64u) {  // '@' - energy token
+            // Consume the @
+            let at_mask = ~(0xFFu << cmd_byte_offset);
+            tape[cmd_word_idx] = tape[cmd_word_idx] & at_mask;
+            remaining_energy = max(remaining_energy, 1u) - 1u;
+            
+            let next_pos = pos + 1;
+            if (next_pos < i32(FULL_TAPE_SIZE)) {
+                let next_word_idx = u32(next_pos) / 4u;
+                let next_byte_offset = (u32(next_pos) % 4u) * 8u;
+                let next_cmd = (tape[next_word_idx] >> next_byte_offset) & 0xFFu;
                 
-                // Track cross-program copies (src in one half, dst in other)
-                let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
-                let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
-                if (src_half != dst_half) {
-                    if (dst_half == 0u) { p1_received_copy = true; }
-                    else { p2_received_copy = true; }
-                }
-            }
-            case 44u: { // ',' - copy from head1 to head0
-                let src_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
-                let dst_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let src_word = src_idx / 4u;
-                let src_off = (src_idx % 4u) * 8u;
-                let val = (tape[src_word] >> src_off) & 0xFFu;
-                let dst_word = dst_idx / 4u;
-                let dst_off = (dst_idx % 4u) * 8u;
-                let mask = ~(0xFFu << dst_off);
-                tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
-                
-                // Track cross-program copies
-                let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
-                let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
-                if (src_half != dst_half) {
-                    if (dst_half == 0u) { p1_received_copy = true; }
-                    else { p2_received_copy = true; }
-                }
-            }
-            case 91u: { // '['
-                let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let h_word = h_idx / 4u;
-                let h_off = (h_idx % 4u) * 8u;
-                let h_val = (tape[h_word] >> h_off) & 0xFFu;
-                if (h_val == 0u) {
-                    var depth: i32 = 1;
-                    pos += 1;
-                    loop {
-                        if (pos >= i32(FULL_TAPE_SIZE) || depth <= 0) { break; }
-                        let c_word = u32(pos) / 4u;
-                        let c_off = (u32(pos) % 4u) * 8u;
-                        let c = (tape[c_word] >> c_off) & 0xFFu;
-                        if (c == 93u) { depth -= 1; }
-                        if (c == 91u) { depth += 1; }
-                        pos += 1;
+                switch (next_cmd) {
+                    case 60u: { head0 -= 1; }   // '<'
+                    case 62u: { head0 += 1; }   // '>'
+                    case 123u: { head1 -= 1; }  // '{'
+                    case 125u: { head1 += 1; }  // '}'
+                    case 43u: {  // '+'
+                        let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let word_idx = idx / 4u;
+                        let byte_off = (idx % 4u) * 8u;
+                        let val = ((tape[word_idx] >> byte_off) & 0xFFu) + 1u;
+                        let mask = ~(0xFFu << byte_off);
+                        tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
                     }
-                    pos -= 1;
-                    if (depth != 0) { pos = i32(FULL_TAPE_SIZE); }
-                }
-            }
-            case 93u: { // ']'
-                let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let h_word = h_idx / 4u;
-                let h_off = (h_idx % 4u) * 8u;
-                let h_val = (tape[h_word] >> h_off) & 0xFFu;
-                if (h_val != 0u) {
-                    var depth: i32 = 1;
-                    pos -= 1;
-                    loop {
-                        if (pos < 0 || depth <= 0) { break; }
-                        let c_word = u32(pos) / 4u;
-                        let c_off = (u32(pos) % 4u) * 8u;
-                        let c = (tape[c_word] >> c_off) & 0xFFu;
-                        if (c == 93u) { depth += 1; }
-                        if (c == 91u) { depth -= 1; }
-                        pos -= 1;
+                    case 45u: {  // '-'
+                        let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let word_idx = idx / 4u;
+                        let byte_off = (idx % 4u) * 8u;
+                        let val = ((tape[word_idx] >> byte_off) & 0xFFu) - 1u;
+                        let mask = ~(0xFFu << byte_off);
+                        tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
                     }
-                    pos += 1;
-                    if (depth != 0) { pos = -1; }
+                    case 46u: {  // '.' copy head0 -> head1
+                        let src_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let dst_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let src_word = src_idx / 4u;
+                        let src_off = (src_idx % 4u) * 8u;
+                        let val = (tape[src_word] >> src_off) & 0xFFu;
+                        let dst_word = dst_idx / 4u;
+                        let dst_off = (dst_idx % 4u) * 8u;
+                        let mask = ~(0xFFu << dst_off);
+                        tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
+                        let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
+                        let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
+                        if (src_half != dst_half) {
+                            if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
+                        }
+                    }
+                    case 44u: {  // ',' copy head1 -> head0
+                        let src_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let dst_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let src_word = src_idx / 4u;
+                        let src_off = (src_idx % 4u) * 8u;
+                        let val = (tape[src_word] >> src_off) & 0xFFu;
+                        let dst_word = dst_idx / 4u;
+                        let dst_off = (dst_idx % 4u) * 8u;
+                        let mask = ~(0xFFu << dst_off);
+                        tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
+                        let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
+                        let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
+                        if (src_half != dst_half) {
+                            if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
+                        }
+                    }
+                    case 91u: {  // '[' loop start
+                        let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h_word = h_idx / 4u;
+                        let h_off = (h_idx % 4u) * 8u;
+                        if (((tape[h_word] >> h_off) & 0xFFu) == 0u) {
+                            var depth: i32 = 1;
+                            var np = next_pos + 1;
+                            loop {
+                                if (np >= i32(FULL_TAPE_SIZE) || depth <= 0) { break; }
+                                let c_word = u32(np) / 4u;
+                                let c_off = (u32(np) % 4u) * 8u;
+                                let c = (tape[c_word] >> c_off) & 0xFFu;
+                                if (c == 93u) { depth -= 1; }
+                                if (c == 91u) { depth += 1; }
+                                np += 1;
+                            }
+                            np -= 1;
+                            if (depth != 0) { np = i32(FULL_TAPE_SIZE); }
+                            pos = np;
+                        } else {
+                            pos = next_pos;
+                        }
+                    }
+                    case 93u: {  // ']' loop end
+                        let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h_word = h_idx / 4u;
+                        let h_off = (h_idx % 4u) * 8u;
+                        if (((tape[h_word] >> h_off) & 0xFFu) != 0u) {
+                            var depth: i32 = 1;
+                            var np = next_pos - 1;
+                            loop {
+                                if (np < 0 || depth <= 0) { break; }
+                                let c_word = u32(np) / 4u;
+                                let c_off = (u32(np) % 4u) * 8u;
+                                let c = (tape[c_word] >> c_off) & 0xFFu;
+                                if (c == 93u) { depth += 1; }
+                                if (c == 91u) { depth -= 1; }
+                                np -= 1;
+                            }
+                            np += 1;
+                            if (depth != 0) { np = -1; }
+                            pos = np;
+                        } else {
+                            pos = next_pos;
+                        }
+                    }
+                    case 33u: {  // '!' halt
+                        pos = i32(FULL_TAPE_SIZE);
+                    }
+                    case 36u: {  // '$' store-energy: harvest @ from other half
+                        let h0 = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h1 = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let current_half = select(0u, 1u, u32(next_pos) >= SINGLE_TAPE_SIZE);
+                        
+                        var can_harvest = false;
+                        var harvest_idx: u32 = 0u;
+                        
+                        if (current_half == 0u) {
+                            let h0_word = h0 / 4u;
+                            let h0_off = (h0 % 4u) * 8u;
+                            let h1_word = h1 / 4u;
+                            let h1_off = (h1 % 4u) * 8u;
+                            if (h0 >= SINGLE_TAPE_SIZE && ((tape[h0_word] >> h0_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h0;
+                            } else if (h1 >= SINGLE_TAPE_SIZE && ((tape[h1_word] >> h1_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h1;
+                            }
+                        } else {
+                            let h0_word = h0 / 4u;
+                            let h0_off = (h0 % 4u) * 8u;
+                            let h1_word = h1 / 4u;
+                            let h1_off = (h1 % 4u) * 8u;
+                            if (h0 < SINGLE_TAPE_SIZE && ((tape[h0_word] >> h0_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h0;
+                            } else if (h1 < SINGLE_TAPE_SIZE && ((tape[h1_word] >> h1_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h1;
+                            }
+                        }
+                        
+                        if (can_harvest) {
+                            let dollar_mask = ~(0xFFu << next_byte_offset);
+                            tape[next_word_idx] = (tape[next_word_idx] & dollar_mask) | (64u << next_byte_offset);
+                            let harv_word = harvest_idx / 4u;
+                            let harv_off = (harvest_idx % 4u) * 8u;
+                            let harv_mask = ~(0xFFu << harv_off);
+                            tape[harv_word] = tape[harv_word] & harv_mask;
+                        }
+                        pos = next_pos;
+                    }
+                    default: { nskip += 1u; }
                 }
             }
-            // Energy operations
-            case 33u: { // '!' - Halt: stop execution immediately
-                pos = i32(FULL_TAPE_SIZE);  // Force exit
-            }
-            case 36u: { // '$' - Store-energy: convert to @
-                let word_idx = u32(pos) / 4u;
-                let byte_off = (u32(pos) % 4u) * 8u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | (64u << byte_off);  // 64 = '@'
-            }
-            case 64u: { // '@' - Stored-energy: consume (set to 0), free step
-                let word_idx = u32(pos) / 4u;
-                let byte_off = (u32(pos) % 4u) * 8u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = tape[word_idx] & mask;  // Set to 0
-                nskip += 1u;  // Free step
-            }
-            default: { nskip += 1u; }
+        } else {
+            nskip += 1u;
         }
         
-        if (pos < 0) { break; }
         pos += 1;
-        if (pos >= i32(FULL_TAPE_SIZE)) { break; }
     }
     } else {
-        // Tape is empty/dead - skip interpreter, count all as skipped
         nskip = params.steps_per_run;
     }
     
@@ -1031,11 +1131,13 @@ fn in_energy_zone(prog_idx: u32) -> bool {
     return in_energy_zone_sim(prog_idx, 0u);
 }
 
-fn get_reserve(state: u32) -> u32 { return state & 0xFFu; }
-fn get_timer(state: u32) -> u32 { return (state >> 8u) & 0xFFu; }
-fn is_dead(state: u32) -> bool { return ((state >> 16u) & 0xFFu) != 0u; }
+// Energy state packing: reserve(16) | timer(15) | dead(1)
+// Matches CUDA kernel format for consistency
+fn get_reserve(state: u32) -> u32 { return state & 0xFFFFu; }
+fn get_timer(state: u32) -> u32 { return (state >> 16u) & 0x7FFFu; }
+fn is_dead(state: u32) -> bool { return (state >> 31u) != 0u; }
 fn pack_state(reserve: u32, timer: u32, dead: bool) -> u32 {
-    return (reserve & 0xFFu) | ((timer & 0xFFu) << 8u) | (select(0u, 1u, dead) << 16u);
+    return (reserve & 0xFFFFu) | ((timer & 0x7FFFu) << 16u) | (select(0u, 1u, dead) << 31u);
 }
 
 fn can_mutate_sim(prog_idx: u32, sim_offset: u32, sim_idx: u32) -> bool {
@@ -1238,9 +1340,27 @@ fn main(
     // Load soup using absolute positions
     let p1_base = p1_abs * (SINGLE_TAPE_SIZE / 4u);
     let p2_base = p2_abs * (SINGLE_TAPE_SIZE / 4u);
-    for (var i = 0u; i < 16u; i++) {
-        tape[i] = soup[p1_base + i];
-        tape[i + 16u] = soup[p2_base + i];
+    
+    // ENERGY ZONE OVERWRITE: Tapes in energy zones become pure energy (@)
+    // 0x40404040 = four '@' characters packed into u32
+    if (p1_in_zone) {
+        for (var i = 0u; i < 16u; i++) {
+            tape[i] = 0x40404040u;  // All '@'
+        }
+    } else {
+        for (var i = 0u; i < 16u; i++) {
+            tape[i] = soup[p1_base + i];
+        }
+    }
+    
+    if (p2_in_zone) {
+        for (var i = 0u; i < 16u; i++) {
+            tape[i + 16u] = 0x40404040u;  // All '@'
+        }
+    } else {
+        for (var i = 0u; i < 16u; i++) {
+            tape[i + 16u] = soup[p2_base + i];
+        }
     }
     
     // Use sim_idx to differentiate RNG per simulation
@@ -1277,149 +1397,230 @@ fn main(
         pair_steps_per_run = min(p1_steps + p2_steps, params.steps_per_run * 2u);
     }
     
-    // BFF evaluation
+    // === TAPE-BASED ENERGY MODEL BFF EVALUATION ===
+    // @ must precede a BFF op for it to execute. BFF ops without @ are NOPs.
+    // $ harvests @ from the other tape half (via head0 or head1).
+    // ! halts execution immediately.
     var pos: i32 = 2;
     var head0: i32 = i32((tape[0] & 0xFFu) % FULL_TAPE_SIZE);
     var head1: i32 = i32(((tape[0] >> 8u) & 0xFFu) % FULL_TAPE_SIZE);
     var nskip: u32 = 0u;
     
-    // Only run interpreter if tape has content
-    if (tape_active) {
+    // Count @ symbols for early termination check
+    var remaining_energy: u32 = 0u;
+    var has_dollar: bool = false;
+    for (var i = 0u; i < 32u; i++) {
+        let w = tape[i];
+        // Check each byte in the word for @ (64) or $ (36)
+        if ((w & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 8u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 16u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if (((w >> 24u) & 0xFFu) == 64u) { remaining_energy += 1u; }
+        if ((w & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 8u) & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 16u) & 0xFFu) == 36u) { has_dollar = true; }
+        if (((w >> 24u) & 0xFFu) == 36u) { has_dollar = true; }
+    }
+    
+    // Only run interpreter if tape has energy or potential to get energy
+    let tape_can_run = remaining_energy > 0u || has_dollar;
+    
+    if (tape_active && tape_can_run) {
     for (var step = 0u; step < pair_steps_per_run; step++) {
+        // Early termination: no energy and no way to get energy
+        if (remaining_energy == 0u && !has_dollar) { break; }
+        if (pos < 0 || pos >= i32(FULL_TAPE_SIZE)) { break; }
+        
         head0 = head0 & i32(FULL_TAPE_SIZE - 1u);
         head1 = head1 & i32(FULL_TAPE_SIZE - 1u);
+        
+        // Read current byte
         let cmd_word_idx = u32(pos) / 4u;
         let cmd_byte_offset = (u32(pos) % 4u) * 8u;
         let cmd = (tape[cmd_word_idx] >> cmd_byte_offset) & 0xFFu;
         
-        // === COMMAND LOOKUP TABLE ===
-        // Look up opcode from shared memory table instead of switching on 256 byte values.
-        // Reduces branch divergence by mapping to smaller opcode range (0-10).
-        let table_word = cmd / 4u;
-        let table_byte = (cmd % 4u) * 8u;
-        let opcode = (cmd_table[table_word] >> table_byte) & 0xFFu;
-        
-        // Switch on opcode (0-10) instead of byte value (0-255)
-        // 0=noop, 1=<, 2=>, 3={, 4=}, 5=+, 6=-, 7=., 8=,, 9=[, 10=]
-        switch (opcode) {
-            case 0u: { nskip += 1u; }  // no-op
-            case 1u: { head0 -= 1; }   // '<'
-            case 2u: { head0 += 1; }   // '>'
-            case 3u: { head1 -= 1; }   // '{'
-            case 4u: { head1 += 1; }   // '}'
-            case 5u: {  // '+' increment
-                let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let word_idx = idx / 4u;
-                let byte_off = (idx % 4u) * 8u;
-                let val = ((tape[word_idx] >> byte_off) & 0xFFu) + 1u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
-            }
-            case 6u: {  // '-' decrement
-                let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let word_idx = idx / 4u;
-                let byte_off = (idx % 4u) * 8u;
-                let val = ((tape[word_idx] >> byte_off) & 0xFFu) - 1u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
-            }
-            case 7u: {  // '.' copy head0 -> head1
-                let src_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let dst_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
-                let src_word = src_idx / 4u;
-                let src_off = (src_idx % 4u) * 8u;
-                let val = (tape[src_word] >> src_off) & 0xFFu;
-                let dst_word = dst_idx / 4u;
-                let dst_off = (dst_idx % 4u) * 8u;
-                let mask = ~(0xFFu << dst_off);
-                tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
-                let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
-                let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
-                if (src_half != dst_half) {
-                    if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
-                }
-            }
-            case 8u: {  // ',' copy head1 -> head0
-                let src_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
-                let dst_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let src_word = src_idx / 4u;
-                let src_off = (src_idx % 4u) * 8u;
-                let val = (tape[src_word] >> src_off) & 0xFFu;
-                let dst_word = dst_idx / 4u;
-                let dst_off = (dst_idx % 4u) * 8u;
-                let mask = ~(0xFFu << dst_off);
-                tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
-                let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
-                let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
-                if (src_half != dst_half) {
-                    if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
-                }
-            }
-            case 9u: {  // '[' loop start
-                let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let h_word = h_idx / 4u;
-                let h_off = (h_idx % 4u) * 8u;
-                if (((tape[h_word] >> h_off) & 0xFFu) == 0u) {
-                    var depth: i32 = 1;
-                    pos += 1;
-                    loop {
-                        if (pos >= i32(FULL_TAPE_SIZE) || depth <= 0) { break; }
-                        let c_word = u32(pos) / 4u;
-                        let c_off = (u32(pos) % 4u) * 8u;
-                        let c = (tape[c_word] >> c_off) & 0xFFu;
-                        if (c == 93u) { depth -= 1; }
-                        if (c == 91u) { depth += 1; }
-                        pos += 1;
+        // === TAPE-BASED ENERGY: @ must precede BFF ops ===
+        if (cmd == 64u) {  // '@' - energy token
+            // Consume the @ (set to 0)
+            let at_mask = ~(0xFFu << cmd_byte_offset);
+            tape[cmd_word_idx] = tape[cmd_word_idx] & at_mask;
+            remaining_energy = max(remaining_energy, 1u) - 1u;
+            
+            // Peek at next byte
+            let next_pos = pos + 1;
+            if (next_pos < i32(FULL_TAPE_SIZE)) {
+                let next_word_idx = u32(next_pos) / 4u;
+                let next_byte_offset = (u32(next_pos) % 4u) * 8u;
+                let next_cmd = (tape[next_word_idx] >> next_byte_offset) & 0xFFu;
+                
+                // Execute the BFF op if it's a valid command
+                switch (next_cmd) {
+                    case 60u: { head0 -= 1; }   // '<'
+                    case 62u: { head0 += 1; }   // '>'
+                    case 123u: { head1 -= 1; }  // '{'
+                    case 125u: { head1 += 1; }  // '}'
+                    case 43u: {  // '+' increment
+                        let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let word_idx = idx / 4u;
+                        let byte_off = (idx % 4u) * 8u;
+                        let val = ((tape[word_idx] >> byte_off) & 0xFFu) + 1u;
+                        let mask = ~(0xFFu << byte_off);
+                        tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
                     }
-                    pos -= 1;
-                    if (depth != 0) { pos = i32(FULL_TAPE_SIZE); }
-                }
-            }
-            case 10u: {  // ']' loop end
-                let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
-                let h_word = h_idx / 4u;
-                let h_off = (h_idx % 4u) * 8u;
-                if (((tape[h_word] >> h_off) & 0xFFu) != 0u) {
-                    var depth: i32 = 1;
-                    pos -= 1;
-                    loop {
-                        if (pos < 0 || depth <= 0) { break; }
-                        let c_word = u32(pos) / 4u;
-                        let c_off = (u32(pos) % 4u) * 8u;
-                        let c = (tape[c_word] >> c_off) & 0xFFu;
-                        if (c == 93u) { depth += 1; }
-                        if (c == 91u) { depth -= 1; }
-                        pos -= 1;
+                    case 45u: {  // '-' decrement
+                        let idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let word_idx = idx / 4u;
+                        let byte_off = (idx % 4u) * 8u;
+                        let val = ((tape[word_idx] >> byte_off) & 0xFFu) - 1u;
+                        let mask = ~(0xFFu << byte_off);
+                        tape[word_idx] = (tape[word_idx] & mask) | ((val & 0xFFu) << byte_off);
                     }
-                    pos += 1;
-                    if (depth != 0) { pos = -1; }
+                    case 46u: {  // '.' copy head0 -> head1
+                        let src_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let dst_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let src_word = src_idx / 4u;
+                        let src_off = (src_idx % 4u) * 8u;
+                        let val = (tape[src_word] >> src_off) & 0xFFu;
+                        let dst_word = dst_idx / 4u;
+                        let dst_off = (dst_idx % 4u) * 8u;
+                        let mask = ~(0xFFu << dst_off);
+                        tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
+                        let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
+                        let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
+                        if (src_half != dst_half) {
+                            if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
+                        }
+                    }
+                    case 44u: {  // ',' copy head1 -> head0
+                        let src_idx = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let dst_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let src_word = src_idx / 4u;
+                        let src_off = (src_idx % 4u) * 8u;
+                        let val = (tape[src_word] >> src_off) & 0xFFu;
+                        let dst_word = dst_idx / 4u;
+                        let dst_off = (dst_idx % 4u) * 8u;
+                        let mask = ~(0xFFu << dst_off);
+                        tape[dst_word] = (tape[dst_word] & mask) | (val << dst_off);
+                        let src_half = select(0u, 1u, src_idx >= SINGLE_TAPE_SIZE);
+                        let dst_half = select(0u, 1u, dst_idx >= SINGLE_TAPE_SIZE);
+                        if (src_half != dst_half) {
+                            if (dst_half == 0u) { p1_received_copy = true; } else { p2_received_copy = true; }
+                        }
+                    }
+                    case 91u: {  // '[' loop start
+                        let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h_word = h_idx / 4u;
+                        let h_off = (h_idx % 4u) * 8u;
+                        if (((tape[h_word] >> h_off) & 0xFFu) == 0u) {
+                            var depth: i32 = 1;
+                            var np = next_pos + 1;
+                            loop {
+                                if (np >= i32(FULL_TAPE_SIZE) || depth <= 0) { break; }
+                                let c_word = u32(np) / 4u;
+                                let c_off = (u32(np) % 4u) * 8u;
+                                let c = (tape[c_word] >> c_off) & 0xFFu;
+                                if (c == 93u) { depth -= 1; }
+                                if (c == 91u) { depth += 1; }
+                                np += 1;
+                            }
+                            np -= 1;
+                            if (depth != 0) { np = i32(FULL_TAPE_SIZE); }
+                            pos = np;
+                        } else {
+                            pos = next_pos;
+                        }
+                    }
+                    case 93u: {  // ']' loop end
+                        let h_idx = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h_word = h_idx / 4u;
+                        let h_off = (h_idx % 4u) * 8u;
+                        if (((tape[h_word] >> h_off) & 0xFFu) != 0u) {
+                            var depth: i32 = 1;
+                            var np = next_pos - 1;
+                            loop {
+                                if (np < 0 || depth <= 0) { break; }
+                                let c_word = u32(np) / 4u;
+                                let c_off = (u32(np) % 4u) * 8u;
+                                let c = (tape[c_word] >> c_off) & 0xFFu;
+                                if (c == 93u) { depth += 1; }
+                                if (c == 91u) { depth -= 1; }
+                                np -= 1;
+                            }
+                            np += 1;
+                            if (depth != 0) { np = -1; }
+                            pos = np;
+                        } else {
+                            pos = next_pos;
+                        }
+                    }
+                    case 33u: {  // '!' halt
+                        pos = i32(FULL_TAPE_SIZE);  // Force exit
+                    }
+                    case 36u: {  // '$' store-energy: harvest @ from other half via heads
+                        let h0 = u32(head0) & (FULL_TAPE_SIZE - 1u);
+                        let h1 = u32(head1) & (FULL_TAPE_SIZE - 1u);
+                        let current_half = select(0u, 1u, u32(next_pos) >= SINGLE_TAPE_SIZE);
+                        
+                        // Check if head0 or head1 points to @ on the OTHER half
+                        var can_harvest = false;
+                        var harvest_idx: u32 = 0u;
+                        
+                        if (current_half == 0u) {
+                            // We're in first half, need @ from second half
+                            let h0_word = h0 / 4u;
+                            let h0_off = (h0 % 4u) * 8u;
+                            let h1_word = h1 / 4u;
+                            let h1_off = (h1 % 4u) * 8u;
+                            if (h0 >= SINGLE_TAPE_SIZE && ((tape[h0_word] >> h0_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h0;
+                            } else if (h1 >= SINGLE_TAPE_SIZE && ((tape[h1_word] >> h1_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h1;
+                            }
+                        } else {
+                            // We're in second half, need @ from first half
+                            let h0_word = h0 / 4u;
+                            let h0_off = (h0 % 4u) * 8u;
+                            let h1_word = h1 / 4u;
+                            let h1_off = (h1 % 4u) * 8u;
+                            if (h0 < SINGLE_TAPE_SIZE && ((tape[h0_word] >> h0_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h0;
+                            } else if (h1 < SINGLE_TAPE_SIZE && ((tape[h1_word] >> h1_off) & 0xFFu) == 64u) {
+                                can_harvest = true;
+                                harvest_idx = h1;
+                            }
+                        }
+                        
+                        if (can_harvest) {
+                            // Convert $ to @
+                            let dollar_mask = ~(0xFFu << next_byte_offset);
+                            tape[next_word_idx] = (tape[next_word_idx] & dollar_mask) | (64u << next_byte_offset);
+                            // Consume the harvested @
+                            let harv_word = harvest_idx / 4u;
+                            let harv_off = (harvest_idx % 4u) * 8u;
+                            let harv_mask = ~(0xFFu << harv_off);
+                            tape[harv_word] = tape[harv_word] & harv_mask;
+                            // Net energy stays same (consumed one @, created one @)
+                        }
+                        pos = next_pos;
+                    }
+                    default: {
+                        // Not a BFF op after @, just skip
+                        nskip += 1u;
+                    }
                 }
             }
-            // Energy operations
-            case 11u: {  // '!' halt - stop execution immediately
-                pos = i32(FULL_TAPE_SIZE);  // Force exit
-            }
-            case 12u: {  // '$' store-energy - convert to @
-                let word_idx = u32(pos) / 4u;
-                let byte_off = (u32(pos) % 4u) * 8u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = (tape[word_idx] & mask) | (64u << byte_off);  // 64 = '@'
-            }
-            case 13u: {  // '@' stored-energy - consume (set to 0), free step
-                let word_idx = u32(pos) / 4u;
-                let byte_off = (u32(pos) % 4u) * 8u;
-                let mask = ~(0xFFu << byte_off);
-                tape[word_idx] = tape[word_idx] & mask;  // Set to 0
-                nskip += 1u;  // Free step
-            }
-            default: { nskip += 1u; }
+        } else {
+            // Not @: BFF ops without energy prefix are NOPs
+            nskip += 1u;
         }
-        if (pos < 0) { break; }
+        
         pos += 1;
-        if (pos >= i32(FULL_TAPE_SIZE)) { break; }
     }
     } else {
-        // Tape is empty/dead - skip interpreter, count all as skipped
+        // Tape is empty/dead or has no energy - skip interpreter
         nskip = pair_steps_per_run;
     }
     
@@ -1523,18 +1724,38 @@ fn main(
         }
     }
     
-    // Write back soup - dead tapes stay zeroed (unless spontaneously spawned)
-    if (p1_stays_dead) {
+    // Write back soup with priority: border > in-zone > dead > alive
+    // Check if in border (dead zone)
+    let p1_local_idx = p1_abs % params.num_programs;
+    let p1_x = i32(p1_local_idx % params.grid_width);
+    let p1_y = i32(p1_local_idx / params.grid_width);
+    let p1_grid_height = i32(params.num_programs / params.grid_width);
+    let bt = i32(energy_params.border_thickness);
+    let p1_in_border = bt > 0 && (p1_x < bt || p1_x >= i32(params.grid_width) - bt || 
+                                   p1_y < bt || p1_y >= p1_grid_height - bt);
+    
+    if (p1_in_border) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
-    } else if (is_dead(energy_state[p1_abs]) && !p1_spawned) {
+    } else if (p1_in_zone) {
+        for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0x40404040u; }  // All '@'
+    } else if (p1_stays_dead || (is_dead(energy_state[p1_abs]) && !p1_spawned)) {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p1_base + i] = tape[i]; }
     }
     
-    if (p2_stays_dead) {
+    let p2_local_idx = p2_abs % params.num_programs;
+    let p2_x = i32(p2_local_idx % params.grid_width);
+    let p2_y = i32(p2_local_idx / params.grid_width);
+    let p2_grid_height = i32(params.num_programs / params.grid_width);
+    let p2_in_border = bt > 0 && (p2_x < bt || p2_x >= i32(params.grid_width) - bt || 
+                                   p2_y < bt || p2_y >= p2_grid_height - bt);
+    
+    if (p2_in_border) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
-    } else if (is_dead(energy_state[p2_abs]) && !p2_spawned) {
+    } else if (p2_in_zone) {
+        for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0x40404040u; }  // All '@'
+    } else if (p2_stays_dead || (is_dead(energy_state[p2_abs]) && !p2_spawned)) {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = 0u; }
     } else {
         for (var i = 0u; i < 16u; i++) { soup[p2_base + i] = tape[i + 16u]; }
@@ -1584,6 +1805,7 @@ fn main(
         reserve_duration: u32,
         death_timer: u32,
         spontaneous_rate: u32,  // 1 in N chance per dead tape in zone (0 = disabled)
+        border_thickness: u32,  // Thickness of dead zone at borders
         // Up to 8 sources: x, y, shape_id (packed), radius_override
         src0_x: u32, src0_y: u32, src0_shape: u32, src0_radius: u32,
         src1_x: u32, src1_y: u32, src1_shape: u32, src1_radius: u32,
@@ -1604,6 +1826,7 @@ fn main(
                 reserve_duration: 5,
                 death_timer: 10,
                 spontaneous_rate: 0,
+                border_thickness: 0,
                 src0_x: 0, src0_y: 0, src0_shape: 0, src0_radius: 64,
                 src1_x: 0, src1_y: 0, src1_shape: 0, src1_radius: 64,
                 src2_x: 0, src2_y: 0, src2_shape: 0, src2_radius: 64,
@@ -1616,7 +1839,7 @@ fn main(
         }
 
         fn from_config(config: &crate::energy::EnergyConfig, _grid_width: usize, _grid_height: usize) -> Self {
-            if !config.enabled || config.sources.is_empty() {
+            if !config.enabled {
                 return Self::disabled();
             }
 
@@ -1646,7 +1869,7 @@ fn main(
                 reserve_duration: config.reserve_duration as u32,
                 death_timer: config.interaction_death as u32,
                 spontaneous_rate: config.spontaneous_rate,
-                border_thickness: 0, // Not used in this legacy struct
+                border_thickness: config.border_thickness as u32,
                 src0_x, src0_y, src0_shape, src0_radius,
                 src1_x, src1_y, src1_shape, src1_radius,
                 src2_x, src2_y, src2_shape, src2_radius,
@@ -2709,39 +2932,6 @@ fn main(
         /// Wait for all pending GPU work to complete
         pub fn sync(&self) {
             self.device.poll(wgpu::Maintain::Wait);
-        }
-
-        /// Update energy config
-        pub fn update_energy_config_all(&mut self, config: &crate::energy::EnergyConfig) {
-            let energy_params = EnergyParams {
-                enabled: if config.enabled { 1 } else { 0 },
-                num_sources: config.sources.len().min(8) as u32,
-                radius: config.default_radius as u32,
-                reserve_duration: config.reserve_duration as u32,
-                death_timer: config.interaction_death as u32,
-                spontaneous_rate: config.spontaneous_rate,
-                border_thickness: config.border_thickness as u32,
-                src0_x: 0, src0_y: 0, src0_shape: 0, src0_radius: 0,
-                src1_x: 0, src1_y: 0, src1_shape: 0, src1_radius: 0,
-                src2_x: 0, src2_y: 0, src2_shape: 0, src2_radius: 0,
-                src3_x: 0, src3_y: 0, src3_shape: 0, src3_radius: 0,
-                src4_x: 0, src4_y: 0, src4_shape: 0, src4_radius: 0,
-                src5_x: 0, src5_y: 0, src5_shape: 0, src5_radius: 0,
-                src6_x: 0, src6_y: 0, src6_shape: 0, src6_radius: 0,
-                src7_x: 0, src7_y: 0, src7_shape: 0, src7_radius: 0,
-            };
-            self.energy_params = energy_params;
-            self.queue.write_buffer(&self.energy_params_buffer, 0, bytemuck::bytes_of(&self.energy_params));
-            
-            // Recompute bitmask if sources changed
-            let map = Self::compute_energy_map_static(
-                &self.energy_params,
-                self.num_programs,
-                self.num_sims,
-                self.grid_width,
-                self.grid_height,
-            );
-            self.queue.write_buffer(&self.energy_map_buffer, 0, bytemuck::cast_slice(&map));
         }
 
         /// Compute energy zone bitmask on CPU

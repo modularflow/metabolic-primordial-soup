@@ -1,5 +1,6 @@
 mod bff;
 mod checkpoint;
+mod cpu_multi;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod energy;
@@ -92,7 +93,7 @@ pub struct CheckpointConfig {
 pub struct OutputConfig {
     pub frame_interval: usize,
     pub frames_dir: String,
-    /// Frame format: "png" (compressed) or "ppm" (uncompressed)
+    /// Frame format: "png", "jpg"/"jpeg", or "ppm" (uncompressed)
     pub frame_format: String,
     /// Downscale factor for regular frames (1 = full, 4 = 1/4 size)
     pub thumbnail_scale: usize,
@@ -108,6 +109,9 @@ pub struct OutputConfig {
     /// Also render frames during simulation
     #[serde(default)]
     pub render_frames: bool,
+    /// Only save mega-simulation frame, not individual sim frames
+    #[serde(default)]
+    pub mega_only: bool,
 }
 
 fn default_raw_dir() -> String {
@@ -233,6 +237,7 @@ impl Default for OutputConfig {
             raw_dir: "raw_data".to_string(),
             async_save: true,
             render_frames: true,
+            mega_only: false,
         }
     }
 }
@@ -539,6 +544,7 @@ struct Args {
     raw_dir: String,
     async_save: bool,
     render_frames: bool,
+    mega_only: bool,
     // Special modes
     render_raw_path: Option<String>,  // --render-raw <path>
     // Energy system options
@@ -594,6 +600,7 @@ impl Default for Args {
             raw_dir: "raw_data".to_string(),
             async_save: true,
             render_frames: true,
+            mega_only: false,
             render_raw_path: None,
             // Energy defaults
             energy_enabled: false,
@@ -647,6 +654,7 @@ impl From<Config> for Args {
             raw_dir: c.output.raw_dir,
             async_save: c.output.async_save,
             render_frames: c.output.render_frames,
+            mega_only: c.output.mega_only,
             render_raw_path: None,  // Only set via CLI
             energy_enabled: c.energy.enabled,
             energy_sources: c.energy.sources,
@@ -1179,6 +1187,7 @@ fn main() {
                             output_path: if args.metrics_output_file.is_empty() { None } else { Some(args.metrics_output_file.clone()) },
                             brotli_quality: args.metrics_brotli_quality,
                         },
+                        args.mega_only,
                     );
                     return;
                 }
@@ -1243,6 +1252,7 @@ fn main() {
                         output_path: if args.metrics_output_file.is_empty() { None } else { Some(args.metrics_output_file.clone()) },
                         brotli_quality: args.metrics_brotli_quality,
                     },
+                    args.mega_only,
                 );
                 return;
             }
@@ -1440,6 +1450,7 @@ fn run_cuda_simulation(
     mut energy_config: Option<energy::EnergyConfig>,
     neighbor_range: usize,
     metrics_config: metrics::MetricsConfig,
+    mega_only: bool,
 ) {
     use std::time::Instant;
     
@@ -1450,8 +1461,11 @@ fn run_cuda_simulation(
     // Create output directories
     if save_frames {
         std::fs::create_dir_all(frames_dir).ok();
-        for sim_idx in 0..num_sims {
-            std::fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx)).ok();
+        // Skip creating individual sim directories if mega_only is enabled
+        if !(mega_only && mega_mode) {
+            for sim_idx in 0..num_sims {
+                std::fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx)).ok();
+            }
         }
     }
     if save_raw {
@@ -1474,6 +1488,9 @@ fn run_cuda_simulation(
             println!("Frame rendering: ENABLED (async, format: {})", frame_format);
         } else {
             println!("Frame rendering: ENABLED (format: {})", frame_format);
+        }
+        if mega_only && mega_mode {
+            println!("  Mode: mega-frame only (skipping individual sim frames)");
         }
     } else if save_raw {
         println!("Frame rendering: DISABLED (will render later with --render-raw)");
@@ -1662,6 +1679,7 @@ fn run_cuda_simulation(
                         frame_format,
                         thumbnail_scale,
                         mega_mode,
+                        mega_only,
                     );
                 } else {
                     if save_raw {
@@ -1689,6 +1707,7 @@ fn run_cuda_simulation(
                             thumbnail_scale,
                             mega_mode,
                             parallel_layout,
+                            mega_only,
                         );
                     }
                 }
@@ -1718,6 +1737,7 @@ fn run_cuda_simulation(
                         thumbnail_scale,
                         mega_mode,
                         parallel_layout,
+                        mega_only,
                     );
                 }
             }
@@ -1846,6 +1866,7 @@ fn run_multi_gpu_simulation(
     raw_dir: &str,
     async_save: bool,
     metrics_config: metrics::MetricsConfig,
+    mega_only: bool,
 ) {
     use std::time::Instant;
     
@@ -1941,9 +1962,15 @@ fn run_multi_gpu_simulation(
         } else {
             println!("Frame rendering: ENABLED (format: {})", frame_format);
         }
+        if mega_only && effective_border_interaction {
+            println!("  Mode: mega-frame only (skipping individual sim frames)");
+        }
         let _ = fs::create_dir_all(frames_dir);
-        for sim_idx in 0..num_sims {
-            let _ = fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx));
+        // Skip creating individual sim directories if mega_only is enabled
+        if !(mega_only && effective_border_interaction) {
+            for sim_idx in 0..num_sims {
+                let _ = fs::create_dir_all(format!("{}/sim_{}", frames_dir, sim_idx));
+            }
         }
     } else if save_raw {
         println!("Frame rendering: DISABLED (will render later with --render-raw)");
@@ -2092,6 +2119,7 @@ fn run_multi_gpu_simulation(
                         frame_format,
                         thumbnail_scale,
                         effective_border_interaction,
+                        mega_only,
                     );
                 } else {
                     if save_raw {
@@ -2119,6 +2147,7 @@ fn run_multi_gpu_simulation(
                             thumbnail_scale,
                             effective_border_interaction,
                             parallel_layout,
+                            mega_only,
                         );
                     }
                 }
@@ -2148,6 +2177,7 @@ fn run_multi_gpu_simulation(
                         thumbnail_scale,
                         effective_border_interaction,
                         parallel_layout,
+                        mega_only,
                     );
                 }
             }
@@ -2226,6 +2256,7 @@ fn run_multi_gpu_simulation(
                     frame_format,
                     thumbnail_scale,
                     effective_border_interaction,
+                    mega_only,
                 );
             } else if let Err(e) = save_raw_data_sync(
                 &all_soup,
@@ -2247,17 +2278,20 @@ fn run_multi_gpu_simulation(
                 // (auto-scaling in save_mega_frame will further reduce if needed)
                 let _ = save_mega_frame(
                     multi_sim, layout_cols, layout_rows, grid_width, grid_height,
-                    frames_dir, max_epochs, thumbnail_scale
+                    frames_dir, max_epochs, thumbnail_scale, frame_format
                 );
             }
             
-            for sim_idx in 0..num_sims {
-                let soup = multi_sim.get_soup(sim_idx);
-                let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
-                let _ = fs::create_dir_all(&sim_frames_dir);
-                // Final frame at full resolution
-                if let Err(e) = save_frame(&soup, grid_width, grid_height, &sim_frames_dir, max_epochs, frame_format, 1) {
-                    eprintln!("Warning: Could not save final frame for sim {}: {}", sim_idx, e);
+            // Skip individual sim frames if mega_only
+            if !(mega_only && effective_border_interaction) {
+                for sim_idx in 0..num_sims {
+                    let soup = multi_sim.get_soup(sim_idx);
+                    let sim_frames_dir = format!("{}/sim_{}", frames_dir, sim_idx);
+                    let _ = fs::create_dir_all(&sim_frames_dir);
+                    // Final frame at full resolution
+                    if let Err(e) = save_frame(&soup, grid_width, grid_height, &sim_frames_dir, max_epochs, frame_format, 1) {
+                        eprintln!("Warning: Could not save final frame for sim {}: {}", sim_idx, e);
+                    }
                 }
             }
         }
@@ -2668,6 +2702,7 @@ fn save_mega_frame(
     frames_dir: &str,
     epoch: usize,
     scale: usize,
+    frame_format: &str,
 ) -> std::io::Result<()> {
     let _ = fs::create_dir_all(frames_dir);
     
@@ -2739,23 +2774,46 @@ fn save_mega_frame(
         }
     }
     
-    // Save as PNG with maximum compression for large images
-    use std::io::BufWriter;
-    let filename = format!("{}/mega_epoch_{:08}.png", frames_dir, epoch);
-    let file = File::create(&filename)?;
-    let w = BufWriter::new(file);
+    // Save in requested format
+    let ext = match frame_format {
+        "jpg" | "jpeg" => "jpg",
+        "png" => "png",
+        _ => "ppm",
+    };
+    let filename = format!("{}/mega_epoch_{:08}.{}", frames_dir, epoch, ext);
     
-    let mut encoder = png::Encoder::new(w, out_width as u32, out_height as u32);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    // Use best compression for large images
-    encoder.set_compression(png::Compression::Best);
-    encoder.set_filter(png::FilterType::Avg);
-    
-    let mut writer = encoder.write_header()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    writer.write_image_data(&mega_img)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    match frame_format {
+        "png" => {
+            use std::io::BufWriter;
+            let file = File::create(&filename)?;
+            let w = BufWriter::new(file);
+            
+            let mut encoder = png::Encoder::new(w, out_width as u32, out_height as u32);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Best);
+            encoder.set_filter(png::FilterType::Avg);
+            
+            let mut writer = encoder.write_header()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writer.write_image_data(&mega_img)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        "jpg" | "jpeg" => {
+            use jpeg_encoder::{Encoder, ColorType};
+            let file = File::create(&filename)?;
+            let encoder = Encoder::new(file, 85);
+            encoder.encode(&mega_img, out_width as u16, out_height as u16, ColorType::Rgb)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        _ => {
+            let mut file = File::create(&filename)?;
+            writeln!(file, "P6")?;
+            writeln!(file, "{} {}", out_width, out_height)?;
+            writeln!(file, "255")?;
+            file.write_all(&mega_img)?;
+        }
+    }
     
     Ok(())
 }
@@ -2772,6 +2830,7 @@ fn save_mega_frame_from_data(
     epoch: usize,
     scale: usize,
     num_sims: usize,
+    frame_format: &str,
 ) -> std::io::Result<()> {
     let _ = fs::create_dir_all(frames_dir);
     
@@ -2846,21 +2905,46 @@ fn save_mega_frame_from_data(
         }
     }
     
-    use std::io::BufWriter;
-    let filename = format!("{}/mega_epoch_{:08}.png", frames_dir, epoch);
-    let file = File::create(&filename)?;
-    let w = BufWriter::new(file);
+    // Save in requested format
+    let ext = match frame_format {
+        "jpg" | "jpeg" => "jpg",
+        "png" => "png",
+        _ => "ppm",
+    };
+    let filename = format!("{}/mega_epoch_{:08}.{}", frames_dir, epoch, ext);
     
-    let mut encoder = png::Encoder::new(w, out_width as u32, out_height as u32);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Best);
-    encoder.set_filter(png::FilterType::Avg);
-    
-    let mut writer = encoder.write_header()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    writer.write_image_data(&mega_img)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    match frame_format {
+        "png" => {
+            use std::io::BufWriter;
+            let file = File::create(&filename)?;
+            let w = BufWriter::new(file);
+            
+            let mut encoder = png::Encoder::new(w, out_width as u32, out_height as u32);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Best);
+            encoder.set_filter(png::FilterType::Avg);
+            
+            let mut writer = encoder.write_header()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writer.write_image_data(&mega_img)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        "jpg" | "jpeg" => {
+            use jpeg_encoder::{Encoder, ColorType};
+            let file = File::create(&filename)?;
+            let encoder = Encoder::new(file, 85);
+            encoder.encode(&mega_img, out_width as u16, out_height as u16, ColorType::Rgb)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        _ => {
+            let mut file = File::create(&filename)?;
+            writeln!(file, "P6")?;
+            writeln!(file, "{} {}", out_width, out_height)?;
+            writeln!(file, "255")?;
+            file.write_all(&mega_img)?;
+        }
+    }
     
     Ok(())
 }
@@ -2877,6 +2961,7 @@ fn save_frames_from_data(
     thumbnail_scale: usize,
     mega_mode: bool,
     parallel_layout: [usize; 2],
+    mega_only: bool,
 ) {
     let _ = fs::create_dir_all(frames_dir);
     if mega_mode {
@@ -2891,9 +2976,15 @@ fn save_frames_from_data(
             epoch,
             thumbnail_scale,
             num_sims,
+            frame_format,
         ) {
             eprintln!("Warning: Could not save mega frame {}: {}", epoch, e);
         }
+    }
+
+    // Skip individual sim frames if mega_only is enabled
+    if mega_only && mega_mode {
+        return;
     }
 
     let sim_size = grid_width * grid_height * 64;
@@ -3000,10 +3091,10 @@ fn save_frame(
     }
     
     // Save in requested format
-    if format == "png" {
-        save_png(&img_data, out_width, out_height, frames_dir, epoch)
-    } else {
-        save_ppm(&img_data, out_width, out_height, frames_dir, epoch)
+    match format {
+        "png" => save_png(&img_data, out_width, out_height, frames_dir, epoch),
+        "jpg" | "jpeg" => save_jpg(&img_data, out_width, out_height, frames_dir, epoch),
+        _ => save_ppm(&img_data, out_width, out_height, frames_dir, epoch),
     }
 }
 
@@ -3048,6 +3139,26 @@ fn save_ppm(
     writeln!(file, "{} {}", width, height)?;
     writeln!(file, "255")?;
     file.write_all(img_data)?;
+    Ok(())
+}
+
+/// Save image data as JPEG (compressed)
+fn save_jpg(
+    img_data: &[u8],
+    width: usize,
+    height: usize,
+    frames_dir: &str,
+    epoch: usize,
+) -> std::io::Result<()> {
+    use jpeg_encoder::{Encoder, ColorType};
+    
+    let path = Path::new(frames_dir).join(format!("{:08}.jpg", epoch));
+    let file = File::create(&path)?;
+    
+    let encoder = Encoder::new(file, 85); // Quality 85 - good balance of size/quality
+    encoder.encode(img_data, width as u16, height as u16, ColorType::Rgb)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    
     Ok(())
 }
 
@@ -3114,6 +3225,7 @@ struct SaveBundle {
     frame_format: String,
     thumbnail_scale: usize,
     mega_mode: bool,
+    mega_only: bool,
 }
 
 /// Message type for async save operations
@@ -3167,6 +3279,7 @@ impl AsyncWriter {
                                 bundle.thumbnail_scale,
                                 bundle.mega_mode,
                                 bundle.layout,
+                                bundle.mega_only,
                             );
                         }
                     }
@@ -3195,6 +3308,7 @@ impl AsyncWriter {
         frame_format: &str,
         thumbnail_scale: usize,
         mega_mode: bool,
+        mega_only: bool,
     ) {
         let msg = SaveMessage::Bundle(SaveBundle {
             data,
@@ -3208,6 +3322,7 @@ impl AsyncWriter {
             frame_format: frame_format.to_string(),
             thumbnail_scale,
             mega_mode,
+            mega_only,
         });
         if self.sender.send(msg).is_err() {
             eprintln!("Warning: async save queue full or closed");
