@@ -3,7 +3,6 @@ mod checkpoint;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod energy;
-mod energy_grid;
 mod fitness;
 mod gpu;
 mod islands;
@@ -33,11 +32,8 @@ pub struct Config {
     pub simulation: SimConfig,
     /// Output settings
     pub output: OutputConfig,
-    /// Energy system settings (legacy zone-based system)
+    /// Energy system settings (zone-based system)
     pub energy: EnergySettings,
-    /// Energy grid system settings (new continuous field system)
-    #[serde(default)]
-    pub energy_grid: energy_grid::EnergyGridConfig,
     /// Checkpoint settings
     pub checkpoint: CheckpointConfig,
     /// Metrics settings (compression ratio tracking for phase transitions)
@@ -370,7 +366,6 @@ impl Default for Config {
             simulation: SimConfig::default(),
             output: OutputConfig::default(),
             energy: EnergySettings::default(),
-            energy_grid: energy_grid::EnergyGridConfig::default(),
             checkpoint: CheckpointConfig::default(),
             metrics: MetricsSettings::default(),
         }
@@ -488,14 +483,6 @@ impl Config {
             return Err("steps_per_run must be greater than 0".to_string());
         }
         
-        // Warn if both energy systems are enabled
-        if self.energy.enabled && self.energy_grid.enabled {
-            warnings.push(
-                "Both 'energy' (zone-based) and 'energy_grid' (continuous field) are enabled. \
-                 Only 'energy' (legacy) will be used. Set energy.enabled: false to use energy_grid."
-                .to_string()
-            );
-        }
         
         // Check frame_interval
         if self.output.frame_interval > self.simulation.max_epochs {
@@ -576,8 +563,6 @@ struct Args {
     metrics_interval: usize,
     metrics_output_file: String,
     metrics_brotli_quality: u32,
-    // Energy grid system (new continuous field)
-    energy_grid_config: energy_grid::EnergyGridConfig,
 }
 
 impl Default for Args {
@@ -632,8 +617,6 @@ impl Default for Args {
             metrics_interval: 1000,
             metrics_output_file: String::new(),
             metrics_brotli_quality: 4,
-            // Energy grid defaults
-            energy_grid_config: energy_grid::EnergyGridConfig::default(),
         }
     }
 }
@@ -684,8 +667,6 @@ impl From<Config> for Args {
             metrics_interval: c.metrics.interval,
             metrics_output_file: c.metrics.output_file,
             metrics_brotli_quality: c.metrics.brotli_quality,
-            // Energy grid settings
-            energy_grid_config: c.energy_grid,
         }
     }
 }
@@ -1019,10 +1000,8 @@ fn main() {
     }
     
     // Build energy config for GPU backends
-    // This covers both legacy energy system AND energy_grid death mechanics
     #[allow(unused_variables)]
     let gpu_energy_config = if args.energy_enabled {
-        // Legacy zone-based energy system
         let ec = energy::EnergyConfig::full_with_options(
             args.grid_width,
             args.grid_height,
@@ -1037,18 +1016,6 @@ fn main() {
             args.seed,
             args.energy_spontaneous_rate,
             args.energy_shape.clone(),
-            args.border_thickness,
-        );
-        Some(ec)
-    } else if args.energy_grid_config.enabled && args.energy_grid_config.death_epochs > 0 {
-        // Energy grid mode with death mechanics enabled
-        // Create a minimal energy config with NO zones but death tracking enabled
-        let ec = energy::EnergyConfig::death_only(
-            args.grid_width,
-            args.grid_height,
-            args.energy_grid_config.reserve_epochs,
-            args.energy_grid_config.death_epochs,
-            args.energy_grid_config.spontaneous_rate,
             args.border_thickness,
         );
         Some(ec)
@@ -1214,7 +1181,6 @@ fn main() {
                             output_path: if args.metrics_output_file.is_empty() { None } else { Some(args.metrics_output_file.clone()) },
                             brotli_quality: args.metrics_brotli_quality,
                         },
-                        args.energy_grid_config.clone(),
                     );
                     return;
                 }
@@ -1464,7 +1430,7 @@ fn run_cuda_simulation(
     parallel_layout: [usize; 2],
     mega_mode: bool,
     migration_probability: f64,
-    border_thickness: usize,
+    _border_thickness: usize,
     checkpoint_enabled: bool,
     checkpoint_interval: usize,
     checkpoint_path: &str,
@@ -1476,7 +1442,6 @@ fn run_cuda_simulation(
     mut energy_config: Option<energy::EnergyConfig>,
     neighbor_range: usize,
     metrics_config: metrics::MetricsConfig,
-    energy_grid_config: energy_grid::EnergyGridConfig,
 ) {
     use std::time::Instant;
     
@@ -1603,31 +1568,6 @@ fn run_cuda_simulation(
         None
     };
     
-    // Create energy grid system if enabled (new continuous field system)
-    // This replaces the legacy binary zone-based energy system
-    let mut energy_grid_system = if energy_grid_config.enabled && energy_config.is_none() {
-        let system = energy_grid::EnergyGridSystem::with_sims(
-            energy_grid_config.clone(),
-            grid_width,
-            grid_height,
-            num_sims,
-        );
-        println!("Energy Grid System: ENABLED");
-        println!("  Grid resolution: {}x{}", grid_width, grid_height);
-        println!("  Diffusion rate: {}", energy_grid_config.diffusion_rate);
-        println!("  Decay rate: {}", energy_grid_config.decay_rate);
-        println!("  Acquisition rate: {}", energy_grid_config.acquisition_rate);
-        println!("  Max reserve: {}", energy_grid_config.max_reserve);
-        println!("  Sources: {}", energy_grid_config.sources.len());
-        
-        // Enable per-tape steps on GPU
-        cuda_sim.set_use_per_tape_steps(true);
-        
-        Some(system)
-    } else {
-        None
-    };
-    
     println!("Running {} epochs across {} simulations...", max_epochs - start_epoch, num_sims);
     
     let layout_cols = parallel_layout[0];
@@ -1648,23 +1588,11 @@ fn run_cuda_simulation(
             cuda_sim.set_pairs_all(&pairs);
         }
         
-        // Update dynamic energy sources if needed (legacy system)
+        // Update dynamic energy sources if needed
         if let Some(ref mut config) = energy_config {
             if config.is_dynamic() && config.update_sources(epoch) {
                 cuda_sim.update_energy_config(config);
             }
-        }
-        
-        // Update energy grid system if enabled (new continuous field system)
-        if let Some(ref mut system) = energy_grid_system {
-            // Update the energy grid (diffusion, decay, sources)
-            system.update();
-            
-            // Compute per-tape steps from grid energy and upload to GPU
-            let all_steps: Vec<u32> = (0..num_sims * num_programs)
-                .map(|i| system.steps_per_run(i))
-                .collect();
-            cuda_sim.set_all_tape_steps(&all_steps);
         }
 
         let next_epoch_needs_save = frame_interval > 0
